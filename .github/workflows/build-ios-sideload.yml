@@ -1,0 +1,160 @@
+name: BUILD — iOS IPA (Sideload)
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_url:
+        description: "Server URL to bake into the app"
+        required: false
+        default: "https://happier.dsathe.pp.ua"
+        type: string
+      app_env:
+        description: "App variant (maps to APP_ENV)"
+        required: true
+        type: choice
+        default: production
+        options:
+          - production
+          - preview
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ios-sideload-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-latest
+    env:
+      APP_ENV: ${{ inputs.app_env }}
+      EXPO_PUBLIC_HAPPY_SERVER_URL: ${{ inputs.server_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: yarn
+          cache-dependency-path: yarn.lock
+
+      - name: Enable Corepack (Yarn)
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+
+      - name: Install dependencies
+        env:
+          YARN_PRODUCTION: "false"
+          npm_config_production: "false"
+          HAPPIER_INSTALL_SCOPE: "ui,protocol,agents"
+          HAPPIER_UI_VENDOR_WEB_ASSETS: "0"
+          HAPPIER_EMBEDDED_POLICY_ENV: ${{ inputs.app_env == 'production' && 'production' || 'preview' }}
+        run: yarn install --frozen-lockfile --ignore-engines
+
+      - name: Expo prebuild (iOS)
+        working-directory: apps/ui
+        run: |
+          set -euo pipefail
+          npx expo prebuild --platform ios --no-install
+          echo "### Expo prebuild complete" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Detect Xcode scheme
+        id: scheme
+        working-directory: apps/ui/ios
+        run: |
+          set -euo pipefail
+          workspace=$(ls -d *.xcworkspace | head -1)
+          echo "workspace=${workspace}" >> "$GITHUB_OUTPUT"
+
+          scheme_list=$(xcodebuild -workspace "${workspace}" -list 2>/dev/null)
+          echo "${scheme_list}"
+
+          # Pick the first scheme listed under "Schemes:"
+          scheme=$(echo "${scheme_list}" | sed -n '/Schemes:/,/^$/{ /Schemes:/d; /^$/d; p; }' | head -1 | xargs)
+          if [ -z "${scheme}" ]; then
+            echo "::error::Could not detect Xcode scheme"
+            exit 1
+          fi
+          echo "scheme=${scheme}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Xcode project"
+            echo "- workspace: \`${workspace}\`"
+            echo "- scheme: \`${scheme}\`"
+            echo "- server_url: \`${{ inputs.server_url }}\`"
+            echo "- app_env: \`${{ inputs.app_env }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install CocoaPods dependencies
+        working-directory: apps/ui/ios
+        run: |
+          set -euo pipefail
+          pod install
+
+      - name: Build unsigned archive
+        working-directory: apps/ui/ios
+        env:
+          WORKSPACE: ${{ steps.scheme.outputs.workspace }}
+          SCHEME: ${{ steps.scheme.outputs.scheme }}
+        run: |
+          set -euo pipefail
+          xcodebuild -workspace "${WORKSPACE}" \
+            -scheme "${SCHEME}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$RUNNER_TEMP/Happier.xcarchive" \
+            archive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -r "$RUNNER_TEMP/Happier.xcarchive/Products/Applications/"*.app "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -r Happier.ipa Payload
+
+          size_bytes=$(wc -c < Happier.ipa | tr -d '[:space:]')
+          echo "### IPA built" >> "$GITHUB_STEP_SUMMARY"
+          echo "- size: $(( size_bytes / 1024 / 1024 )) MB" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: happier-ios-sideload
+          path: ${{ runner.temp }}/Happier.ipa
+          retention-days: 30
+
+      - name: Installation instructions
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'GUIDE'
+
+          ---
+
+          ### Installing on iPhone via SideStore
+
+          1. **Download** the `happier-ios-sideload` artifact from this workflow run
+          2. **Unzip** the downloaded archive to get `Happier.ipa`
+          3. **Install SideStore** on your iPhone ([sidestore.io](https://sidestore.io)):
+             - Install WireGuard on your iPhone
+             - Generate a pairing file from your computer (macOS/Linux):
+               ```
+               sudo apt install usbmuxd libimobiledevice-utils   # Linux
+               idevicepair pair
+               ```
+             - Transfer the pairing file to SideStore
+          4. **Open SideStore** → tap "+" → select `Happier.ipa`
+          5. SideStore signs with your free Apple ID and installs the app
+          6. **Refresh every 7 days**: open SideStore periodically to auto-refresh
+
+          > The app is pre-configured to connect to `${{ inputs.server_url }}`
+          GUIDE
